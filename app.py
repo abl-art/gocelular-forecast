@@ -82,7 +82,7 @@ def get_stock_by_model():
         conn.close()
 
 
-def seasonal_forecast(df, days=90):
+def seasonal_forecast(df, days=90, events=None):
     """Simple seasonal forecast using weekly pattern + trend."""
     if len(df) < 7:
         return None
@@ -113,6 +113,12 @@ def seasonal_forecast(df, days=90):
         trend_adj = daily_trend * i
         yhat = max(0, seasonal + trend_adj)
 
+        # Apply event multiplier if matching month
+        if events:
+            month_key = future_date.strftime("%Y-%m")
+            if month_key in events:
+                yhat *= events[month_key]
+
         # Confidence interval (wider as we go further)
         std = df["y"].std() * (1 + i * 0.02)
         forecasts.append({
@@ -136,7 +142,7 @@ def seasonal_forecast(df, days=90):
     return actuals + forecasts
 
 
-def forecast_model(df_model, days=30):
+def forecast_model(df_model, days=30, events=None):
     """Forecast for a single model."""
     if len(df_model) < 3:
         return None
@@ -162,6 +168,12 @@ def forecast_model(df_model, days=30):
         future_date = last_date + timedelta(days=i)
         dow = future_date.weekday()
         yhat = max(0, weekly_pattern.get(dow, recent))
+
+        # Apply event multiplier if matching month
+        if events:
+            month_key = future_date.strftime("%Y-%m")
+            if month_key in events:
+                yhat *= events[month_key]
 
         daily.append({
             "ds": future_date.strftime("%Y-%m-%d"),
@@ -197,12 +209,18 @@ def debug_db():
         return jsonify({"db": "error", "message": str(e)}), 500
 
 
-@app.route("/forecast/total")
+@app.route("/forecast/total", methods=["GET", "POST"])
 def api_forecast_total():
     try:
-        days = request.args.get("days", 90, type=int)
+        events = None
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            days = body.get("days", 90)
+            events = body.get("events")
+        else:
+            days = request.args.get("days", 90, type=int)
         df = get_total_sales()
-        result = seasonal_forecast(df, days)
+        result = seasonal_forecast(df, days, events=events)
         if result is None:
             return jsonify({"error": "Not enough data"}), 400
         return jsonify(result)
@@ -210,10 +228,16 @@ def api_forecast_total():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/forecast/models")
+@app.route("/forecast/models", methods=["GET", "POST"])
 def api_forecast_models():
     try:
-        days = request.args.get("days", 30, type=int)
+        events = None
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            days = body.get("days", 30)
+            events = body.get("events")
+        else:
+            days = request.args.get("days", 30, type=int)
         df = get_sales_data()
         if len(df) < 3:
             return jsonify({})
@@ -224,7 +248,7 @@ def api_forecast_models():
         results = {}
         for modelo in top_models:
             model_df = df[df["modelo"] == modelo][["ds", "y"]].copy()
-            fc = forecast_model(model_df, days)
+            fc = forecast_model(model_df, days, events=events)
             if fc:
                 results[modelo] = fc
 
@@ -233,10 +257,16 @@ def api_forecast_models():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/forecast/compras")
+@app.route("/forecast/compras", methods=["GET", "POST"])
 def api_forecast_compras():
     try:
-        days = 15
+        events = None
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            days = body.get("days", 15)
+            events = body.get("events")
+        else:
+            days = request.args.get("days", 15, type=int)
         df = get_sales_data()
 
         model_counts = df.groupby("modelo")["y"].sum().sort_values(ascending=False)
@@ -245,7 +275,7 @@ def api_forecast_compras():
         model_forecasts = {}
         for modelo in top_models:
             model_df = df[df["modelo"] == modelo][["ds", "y"]].copy()
-            fc = forecast_model(model_df, days)
+            fc = forecast_model(model_df, days, events=events)
             if fc:
                 model_forecasts[modelo] = fc
 
