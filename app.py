@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pandas as pd
-from prophet import Prophet
+import numpy as np
 import psycopg2
 
 app = Flask(__name__)
@@ -67,10 +67,11 @@ def get_stock_by_model():
     try:
         query = """
             SELECT
-                COALESCE(dm.model_code, ii.model_code, 'Desconocido') AS modelo,
+                COALESCE(sp.display_name, dm.model_code, 'Desconocido') AS modelo,
                 COUNT(*)::int AS stock
             FROM inventory_items ii
             LEFT JOIN device_models dm ON dm.model_code = ii.model_code
+            LEFT JOIN store_products sp ON sp.model_code = ii.model_code
             WHERE ii.status = 'available'
             GROUP BY 1
             ORDER BY 2 DESC
@@ -81,83 +82,101 @@ def get_stock_by_model():
         conn.close()
 
 
-def forecast_total(days=90):
-    """Run Prophet on total daily sales."""
-    df = get_total_sales()
+def seasonal_forecast(df, days=90):
+    """Simple seasonal forecast using weekly pattern + trend."""
     if len(df) < 7:
         return None
 
-    m = Prophet(
-        daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=False,
-        seasonality_mode="multiplicative",
-    )
-    m.fit(df)
+    # Fill missing dates
+    date_range = pd.date_range(df["ds"].min(), df["ds"].max())
+    df = df.set_index("ds").reindex(date_range, fill_value=0).reset_index()
+    df.columns = ["ds", "y"]
 
-    future = m.make_future_dataframe(periods=days)
-    forecast = m.predict(future)
+    # Calculate weekly seasonality (avg by day of week)
+    df["dow"] = df["ds"].dt.dayofweek
+    weekly_pattern = df.groupby("dow")["y"].mean().to_dict()
 
-    # Merge actuals
-    result = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
-    result = result.merge(df, on="ds", how="left")
-    result["ds"] = result["ds"].dt.strftime("%Y-%m-%d")
+    # Calculate trend using last 14 days vs previous 14 days
+    recent = df.tail(14)["y"].mean()
+    previous = df.tail(28).head(14)["y"].mean() if len(df) >= 28 else recent
+    daily_trend = (recent - previous) / 14 if previous > 0 else 0
 
-    return result.to_dict(orient="records")
+    # Generate forecast
+    last_date = df["ds"].max()
+    overall_mean = df["y"].mean()
+    forecasts = []
+
+    for i in range(1, days + 1):
+        future_date = last_date + timedelta(days=i)
+        dow = future_date.weekday()
+        seasonal = weekly_pattern.get(dow, overall_mean)
+        trend_adj = daily_trend * i
+        yhat = max(0, seasonal + trend_adj)
+
+        # Confidence interval (wider as we go further)
+        std = df["y"].std() * (1 + i * 0.02)
+        forecasts.append({
+            "ds": future_date.strftime("%Y-%m-%d"),
+            "yhat": round(yhat, 1),
+            "yhat_lower": round(max(0, yhat - 1.5 * std), 1),
+            "yhat_upper": round(yhat + 1.5 * std, 1),
+        })
+
+    # Build result with actuals + forecast
+    actuals = []
+    for _, row in df.iterrows():
+        actuals.append({
+            "ds": row["ds"].strftime("%Y-%m-%d"),
+            "y": float(row["y"]),
+            "yhat": None,
+            "yhat_lower": None,
+            "yhat_upper": None,
+        })
+
+    return actuals + forecasts
 
 
-def forecast_by_model(days=30):
-    """Run Prophet per model (top models only)."""
-    df = get_sales_data()
-    if len(df) < 7:
-        return {}
+def forecast_model(df_model, days=30):
+    """Forecast for a single model."""
+    if len(df_model) < 3:
+        return None
 
-    # Only forecast models with enough data
-    model_counts = df.groupby("modelo")["y"].sum().sort_values(ascending=False)
-    top_models = model_counts.head(15).index.tolist()
+    # Fill missing dates
+    date_range = pd.date_range(df_model["ds"].min(), df_model["ds"].max())
+    df_filled = df_model.set_index("ds").reindex(date_range, fill_value=0).reset_index()
+    df_filled.columns = ["ds", "y"]
 
-    results = {}
-    for modelo in top_models:
-        model_df = df[df["modelo"] == modelo][["ds", "y"]].copy()
+    # Weekly pattern
+    df_filled["dow"] = df_filled["ds"].dt.dayofweek
+    weekly_pattern = df_filled.groupby("dow")["y"].mean().to_dict()
 
-        # Fill missing dates with 0
-        date_range = pd.date_range(model_df["ds"].min(), model_df["ds"].max())
-        model_df = model_df.set_index("ds").reindex(date_range, fill_value=0).reset_index()
-        model_df.columns = ["ds", "y"]
+    # Trend
+    recent = df_filled.tail(7)["y"].mean()
 
-        if len(model_df) < 7:
-            continue
+    last_date = df_filled["ds"].max()
+    total_15 = 0
+    total_30 = 0
+    daily = []
 
-        try:
-            m = Prophet(
-                daily_seasonality=False,
-                weekly_seasonality=True,
-                yearly_seasonality=False,
-                seasonality_mode="multiplicative",
-            )
-            m.fit(model_df)
+    for i in range(1, days + 1):
+        future_date = last_date + timedelta(days=i)
+        dow = future_date.weekday()
+        yhat = max(0, weekly_pattern.get(dow, recent))
 
-            future = m.make_future_dataframe(periods=days)
-            fc = m.predict(future)
+        daily.append({
+            "ds": future_date.strftime("%Y-%m-%d"),
+            "yhat": round(yhat, 1),
+        })
 
-            # Get forecast for future period only
-            future_fc = fc[fc["ds"] > model_df["ds"].max()][["ds", "yhat"]].copy()
-            future_fc["yhat"] = future_fc["yhat"].clip(lower=0).round(1)
-            future_fc["ds"] = future_fc["ds"].dt.strftime("%Y-%m-%d")
+        if i <= 15:
+            total_15 += yhat
+        total_30 += yhat
 
-            # Sum forecast for next 15 and 30 days
-            total_15 = future_fc.head(15)["yhat"].sum()
-            total_30 = future_fc.head(30)["yhat"].sum()
-
-            results[modelo] = {
-                "forecast_15d": round(total_15),
-                "forecast_30d": round(total_30),
-                "daily": future_fc.to_dict(orient="records"),
-            }
-        except Exception:
-            continue
-
-    return results
+    return {
+        "forecast_15d": round(total_15),
+        "forecast_30d": round(total_30),
+        "daily": daily,
+    }
 
 
 @app.route("/health")
@@ -165,11 +184,25 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/debug/db")
+def debug_db():
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM gocuotas_orders LIMIT 1")
+        count = cur.fetchone()[0]
+        conn.close()
+        return jsonify({"db": "ok", "orders_count": count})
+    except Exception as e:
+        return jsonify({"db": "error", "message": str(e)}), 500
+
+
 @app.route("/forecast/total")
 def api_forecast_total():
     try:
         days = request.args.get("days", 90, type=int)
-        result = forecast_total(days)
+        df = get_total_sales()
+        result = seasonal_forecast(df, days)
         if result is None:
             return jsonify({"error": "Not enough data"}), 400
         return jsonify(result)
@@ -181,18 +214,40 @@ def api_forecast_total():
 def api_forecast_models():
     try:
         days = request.args.get("days", 30, type=int)
-        result = forecast_by_model(days)
-        return jsonify(result)
+        df = get_sales_data()
+        if len(df) < 3:
+            return jsonify({})
+
+        model_counts = df.groupby("modelo")["y"].sum().sort_values(ascending=False)
+        top_models = model_counts.head(15).index.tolist()
+
+        results = {}
+        for modelo in top_models:
+            model_df = df[df["modelo"] == modelo][["ds", "y"]].copy()
+            fc = forecast_model(model_df, days)
+            if fc:
+                results[modelo] = fc
+
+        return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/forecast/compras")
 def api_forecast_compras():
-    """Calculate purchase recommendations: forecast 15d - current stock."""
     try:
         days = 15
-        model_forecast = forecast_by_model(days)
+        df = get_sales_data()
+
+        model_counts = df.groupby("modelo")["y"].sum().sort_values(ascending=False)
+        top_models = model_counts.head(15).index.tolist()
+
+        model_forecasts = {}
+        for modelo in top_models:
+            model_df = df[df["modelo"] == modelo][["ds", "y"]].copy()
+            fc = forecast_model(model_df, days)
+            if fc:
+                model_forecasts[modelo] = fc
 
         try:
             stock_df = get_stock_by_model()
@@ -201,7 +256,7 @@ def api_forecast_compras():
             stock_map = {}
 
         recommendations = []
-        for modelo, data in model_forecast.items():
+        for modelo, data in model_forecasts.items():
             forecast_15d = data["forecast_15d"]
             current_stock = stock_map.get(modelo, 0)
             deficit = max(0, forecast_15d - current_stock)
@@ -217,20 +272,6 @@ def api_forecast_compras():
         return jsonify(recommendations)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug/db")
-def debug_db():
-    """Test DB connection."""
-    try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM gocuotas_orders LIMIT 1")
-        count = cur.fetchone()[0]
-        conn.close()
-        return jsonify({"db": "ok", "orders_count": count})
-    except Exception as e:
-        return jsonify({"db": "error", "message": str(e)}), 500
 
 
 if __name__ == "__main__":
