@@ -160,8 +160,7 @@ def forecast_model(df_model, days=30, events=None):
     recent = df_filled.tail(7)["y"].mean()
 
     last_date = df_filled["ds"].max()
-    total_15 = 0
-    total_30 = 0
+    total = 0
     daily = []
 
     for i in range(1, days + 1):
@@ -180,13 +179,10 @@ def forecast_model(df_model, days=30, events=None):
             "yhat": round(yhat, 1),
         })
 
-        if i <= 15:
-            total_15 += yhat
-        total_30 += yhat
+        total += yhat
 
     return {
-        "forecast_15d": round(total_15),
-        "forecast_30d": round(total_30),
+        "forecast": round(total),
         "daily": daily,
     }
 
@@ -287,13 +283,13 @@ def api_forecast_compras():
 
         recommendations = []
         for modelo, data in model_forecasts.items():
-            forecast_15d = data["forecast_15d"]
+            forecast_total = data["forecast"]
             current_stock = stock_map.get(modelo, 0)
-            deficit = max(0, forecast_15d - current_stock)
+            deficit = max(0, forecast_total - current_stock)
 
             recommendations.append({
                 "modelo": modelo,
-                "forecast_15d": forecast_15d,
+                "forecast": forecast_total,
                 "stock_actual": current_stock,
                 "comprar": deficit,
             })
