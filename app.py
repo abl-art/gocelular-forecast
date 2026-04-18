@@ -167,48 +167,70 @@ def health():
 
 @app.route("/forecast/total")
 def api_forecast_total():
-    days = request.args.get("days", 90, type=int)
-    result = forecast_total(days)
-    if result is None:
-        return jsonify({"error": "Not enough data"}), 400
-    return jsonify(result)
+    try:
+        days = request.args.get("days", 90, type=int)
+        result = forecast_total(days)
+        if result is None:
+            return jsonify({"error": "Not enough data"}), 400
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/forecast/models")
 def api_forecast_models():
-    days = request.args.get("days", 30, type=int)
-    result = forecast_by_model(days)
-    return jsonify(result)
+    try:
+        days = request.args.get("days", 30, type=int)
+        result = forecast_by_model(days)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/forecast/compras")
 def api_forecast_compras():
     """Calculate purchase recommendations: forecast 15d - current stock."""
-    days = 15
-    model_forecast = forecast_by_model(days)
-
     try:
-        stock_df = get_stock_by_model()
-        stock_map = dict(zip(stock_df["modelo"], stock_df["stock"]))
-    except Exception:
-        stock_map = {}
+        days = 15
+        model_forecast = forecast_by_model(days)
 
-    recommendations = []
-    for modelo, data in model_forecast.items():
-        forecast_15d = data["forecast_15d"]
-        current_stock = stock_map.get(modelo, 0)
-        deficit = max(0, forecast_15d - current_stock)
+        try:
+            stock_df = get_stock_by_model()
+            stock_map = dict(zip(stock_df["modelo"], stock_df["stock"]))
+        except Exception:
+            stock_map = {}
 
-        recommendations.append({
-            "modelo": modelo,
-            "forecast_15d": forecast_15d,
-            "stock_actual": current_stock,
-            "comprar": deficit,
-        })
+        recommendations = []
+        for modelo, data in model_forecast.items():
+            forecast_15d = data["forecast_15d"]
+            current_stock = stock_map.get(modelo, 0)
+            deficit = max(0, forecast_15d - current_stock)
 
-    # Sort by comprar descending
-    recommendations.sort(key=lambda x: x["comprar"], reverse=True)
-    return jsonify(recommendations)
+            recommendations.append({
+                "modelo": modelo,
+                "forecast_15d": forecast_15d,
+                "stock_actual": current_stock,
+                "comprar": deficit,
+            })
+
+        recommendations.sort(key=lambda x: x["comprar"], reverse=True)
+        return jsonify(recommendations)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/debug/db")
+def debug_db():
+    """Test DB connection."""
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM gocuotas_orders LIMIT 1")
+        count = cur.fetchone()[0]
+        conn.close()
+        return jsonify({"db": "ok", "orders_count": count})
+    except Exception as e:
+        return jsonify({"db": "error", "message": str(e)}), 500
 
 
 if __name__ == "__main__":
