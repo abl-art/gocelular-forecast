@@ -28,6 +28,7 @@ def get_sales_data():
                 AND o.order_discarded_at IS NULL
                 AND o.client_id::text IN ('1', '2026134', '2461631', '5495277')
                 AND o.order_created_at >= '2026-03-23'
+                AND so.product_name IS NOT NULL
             GROUP BY 1, 2
             ORDER BY 1
         """
@@ -47,6 +48,7 @@ def get_total_sales():
                 o.order_created_at::date AS ds,
                 COUNT(*)::int AS y
             FROM gocuotas_orders o
+            JOIN store_orders so ON so.id::text = o.store_order_id
             WHERE o.order_delivered_at IS NOT NULL
                 AND o.order_discarded_at IS NULL
                 AND o.client_id::text IN ('1', '2026134', '2461631', '5495277')
